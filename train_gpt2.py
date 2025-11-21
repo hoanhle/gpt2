@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import time
 
 #----------------------------------------------------------------------------
 
@@ -237,21 +238,24 @@ if __name__ == "__main__":
     # TODO: add mps on apple. need to also change pyproject.toml
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    train_dataloader = DataLoaderLite(B=4, T=32)
+    train_dataloader = DataLoaderLite(B=8, T=1024)
     model = GPT(GPTConfig())
     model.to(device)
     
     # optimize
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # TODO: experiment with Muon here
-    for i in range(50):
+    for i in range(1000):
+        t0 = time.time()
         optimizer.zero_grad()
         x, y = train_dataloader.next_batch()
         x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
-
-        print(f"step {i}, loss: {loss.item()}")
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
 
     import sys; sys.exit(0) # skip sampling part for now
 
