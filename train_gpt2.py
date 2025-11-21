@@ -173,7 +173,42 @@ class GPT(nn.Module):
         
         return logits, loss
 
+#----------------------------------------------------------------------------
 
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open("input.txt", "r") as f:
+            text = f.read()
+        
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+    
+        # state
+        self.current_position =  0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+
+        self.current_position += B * T
+        
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0
+    
+        return x, y
+    
 
 #----------------------------------------------------------------------------
 
@@ -184,19 +219,7 @@ if __name__ == "__main__":
     # TODO: add mps on apple. need to also change pyproject.toml
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    import tiktoken
-    enc = tiktoken.get_encoding("gpt2")
-    with open("input.txt", "r") as f:
-        text = f.read()
-    
-    text = text[:1000]
-    tokens = enc.encode(text)
-    
-    B, T = 4, 32
-    buf = torch.tensor(tokens[:B*T + 1], device=device)
-    x = buf[:-1].view(B, T)
-    y = buf[1:].view(B, T)
-
+    train_dataloader = DataLoaderLite(B=4, T=32)
     model = GPT(GPTConfig())
     model.to(device)
     
@@ -204,6 +227,8 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # TODO: experiment with Muon here
     for i in range(50):
         optimizer.zero_grad()
+        x, y = train_dataloader.next_batch()
+        x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
         optimizer.step()
