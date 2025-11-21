@@ -25,6 +25,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1.0 # scale the weights to account for accumulation on residual path
 
         # regularization
         self.n_heads = config.n_head
@@ -102,6 +103,23 @@ class GPT(nn.Module):
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init all weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * module.NANOGPT_SCALE_INIT) ** 0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     @classmethod
     def from_pretrained(cls, model_type: str):
