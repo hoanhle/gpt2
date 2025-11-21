@@ -12,7 +12,7 @@ class GPTConfig:
     vocab_size: int = 50257 # 50000 bpe merges + 256 bytes token + 1 <|endoftext|> token # TODO: watch tokenizer video
     n_layer: int = 12
     n_head: int = 12
-    n_embd: int = 384
+    n_embd: int = 768
 
 #----------------------------------------------------------------------------
 
@@ -148,7 +148,7 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
     
-    def forward(self, idx): # input is token indices
+    def forward(self, idx, targets = None): # input is token indices
         # idx is of shape (B, T)
         B, T = idx.shape
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -166,7 +166,12 @@ class GPT(nn.Module):
         # forward the final layer norm and the classification head
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
-        return logits
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        return logits, loss
 
 
 
@@ -175,12 +180,44 @@ class GPT(nn.Module):
 if __name__ == "__main__":
     max_return_sequences = 5
     max_seq_length = 30
+
+    # TODO: add mps on apple. need to also change pyproject.toml
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    import tiktoken
+    enc = tiktoken.get_encoding("gpt2")
+    with open("input.txt", "r") as f:
+        text = f.read()
+    
+    text = text[:1000]
+    tokens = enc.encode(text)
+    
+    B, T = 4, 32
+    buf = torch.tensor(tokens[:B*T + 1], device=device)
+    x = buf[:-1].view(B, T)
+    y = buf[1:].view(B, T)
+
+    model = GPT(GPTConfig())
+    model.to(device)
+    
+    # optimize
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # TODO: experiment with Muon here
+    for i in range(50):
+        optimizer.zero_grad()
+        logits, loss = model(x, y)
+        loss.backward()
+        optimizer.step()
+
+        print(f"step {i}, loss: {loss.item()}")
+
+    import sys; sys.exit(0) # skip sampling part for now
+
+    # eval part
     model = GPT.from_pretrained("gpt2")
     model.eval()
     model.to("cuda")
 
-    import tiktoken
-    enc = tiktoken.get_encoding("gpt2")
+
     text = "Hello, I'm a language model"
     tokens = enc.encode(text)
     tokens = torch.tensor(tokens, dtype=torch.long)
