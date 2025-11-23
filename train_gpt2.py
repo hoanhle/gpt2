@@ -249,10 +249,32 @@ if __name__ == "__main__":
     model = GPT(GPTConfig()) # can change vocab size here to be "nice number"
     model.to(device)
     model = torch.compile(model) # huge speed up from this op
+
+    # use cosine decay lr similar to gpt-3 paper
+    # NOTE: follow the paper's suggestion to use 6e-4 as max_lr for 124M model
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 10
+    max_steps = 50
+    def get_lr(step):
+        # 1. linear warmup for warmup_iters steps
+        if step < warmup_steps:
+            return max_lr * (step + 1) / warmup_steps
+        
+        # 2. if step > max_steps, use min_lr
+        if step > max_steps:
+            return min_lr
+        
+        # 3. in between, use cosine decay down to min_lr
+        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
     
     # optimize
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # TODO: experiment with Muon here
-    for i in range(1000):
+    # NOTE: hyperparameters are from GPT-3 paper
+    optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8) # TODO: experiment with Muon here
+    for step in range(max_steps):
         t0 = time.time()
         optimizer.zero_grad()
         x, y = train_dataloader.next_batch()
@@ -263,12 +285,20 @@ if __name__ == "__main__":
             logits, loss = model(x, y)
         
         loss.backward()
+
+        # clip the global norm of the gradients to 1.0 (gpt-3 paper)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+
         optimizer.step()
-        torch.cuda.synchronize()
+        torch.cuda.synchronize() # wait for the gpu to finish work
         t1 = time.time()
         dt = (t1 - t0) * 1000 # time difference in milliseconds
         tokens_per_sec = (train_dataloader.B * train_dataloader.T) / (t1 - t0)
-        print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
 
     import sys; sys.exit(0) # skip sampling part for now
 
