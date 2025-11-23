@@ -239,8 +239,14 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     train_dataloader = DataLoaderLite(B=8, T=1024)
+
+    # Read https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf
+    # to see difference between float32, tensorfloat32 and bfloat16
+    # Although i'm still not sure why speed up is not that much. (maybe memory-bound?)
+    torch.set_float32_matmul_precision("high")
     model = GPT(GPTConfig())
     model.to(device)
+    model = torch.compile(model) # huge speed up from this op
     
     # optimize
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) # TODO: experiment with Muon here
@@ -249,13 +255,18 @@ if __name__ == "__main__":
         optimizer.zero_grad()
         x, y = train_dataloader.next_batch()
         x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
+        
+        # NOTE: read autocast documentation for more details
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        
         loss.backward()
         optimizer.step()
         torch.cuda.synchronize()
         t1 = time.time()
-        dt = (t1 - t0) * 1000
-        print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms")
+        dt = (t1 - t0) * 1000 # time difference in milliseconds
+        tokens_per_sec = (train_dataloader.B * train_dataloader.T) / (t1 - t0)
+        print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_sec:.2f}")
 
     import sys; sys.exit(0) # skip sampling part for now
 
