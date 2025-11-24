@@ -233,119 +233,124 @@ class DataLoaderLite:
 
 #----------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    max_return_sequences = 5
-    max_seq_length = 30
+max_return_sequences = 5
+max_seq_length = 30
 
-    # TODO: add mps on apple. need to also change pyproject.toml
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+# TODO: add mps on apple. need to also change pyproject.toml
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+train_dataloader = DataLoaderLite(B=8, T=1024)
+
+# Read https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf
+# to see difference between float32, tensorfloat32 and bfloat16
+# Although i'm still not sure why speed up is not that much. (maybe memory-bound?)
+torch.set_float32_matmul_precision("high")
+model = GPT(GPTConfig()) # can change vocab size here to be "nice number"
+model.to(device)
+model = torch.compile(model) # huge speed up from this op
+
+#----------------------------------------------------------------------------
+
+# use cosine decay lr similar to gpt-3 paper
+# NOTE: follow the paper's suggestion to use 6e-4 as max_lr for 124M model
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(step):
+    # 1. linear warmup for warmup_iters steps
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
     
-    train_dataloader = DataLoaderLite(B=8, T=1024)
-
-    # Read https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf
-    # to see difference between float32, tensorfloat32 and bfloat16
-    # Although i'm still not sure why speed up is not that much. (maybe memory-bound?)
-    torch.set_float32_matmul_precision("high")
-    model = GPT(GPTConfig()) # can change vocab size here to be "nice number"
-    model.to(device)
-    model = torch.compile(model) # huge speed up from this op
-
-    # use cosine decay lr similar to gpt-3 paper
-    # NOTE: follow the paper's suggestion to use 6e-4 as max_lr for 124M model
-    max_lr = 6e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 10
-    max_steps = 50
-    def get_lr(step):
-        # 1. linear warmup for warmup_iters steps
-        if step < warmup_steps:
-            return max_lr * (step + 1) / warmup_steps
-        
-        # 2. if step > max_steps, use min_lr
-        if step > max_steps:
-            return min_lr
-        
-        # 3. in between, use cosine decay down to min_lr
-        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return min_lr + coeff * (max_lr - min_lr)
+    # 2. if step > max_steps, use min_lr
+    if step > max_steps:
+        return min_lr
     
-    # optimize
-    # NOTE: hyperparameters are from GPT-3 paper
-    optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8) # TODO: experiment with Muon here
-    for step in range(max_steps):
-        t0 = time.time()
-        optimizer.zero_grad()
-        x, y = train_dataloader.next_batch()
-        x, y = x.to(device), y.to(device)
-        
-        # NOTE: read autocast documentation for more details
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        
-        loss.backward()
+    # 3. in between, use cosine decay down to min_lr
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
 
-        # clip the global norm of the gradients to 1.0 (gpt-3 paper)
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#----------------------------------------------------------------------------
 
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
-
-        optimizer.step()
-        torch.cuda.synchronize() # wait for the gpu to finish work
-        t1 = time.time()
-        dt = (t1 - t0) * 1000 # time difference in milliseconds
-        tokens_per_sec = (train_dataloader.B * train_dataloader.T) / (t1 - t0)
-        print(f"step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
-
-    import sys; sys.exit(0) # skip sampling part for now
-
-    # eval part
-    model = GPT.from_pretrained("gpt2")
-    model.eval()
-    model.to("cuda")
-
-
-    text = "Hello, I'm a language model"
-    tokens = enc.encode(text)
-    tokens = torch.tensor(tokens, dtype=torch.long)
-    tokens = tokens.unsqueeze(0).repeat(max_return_sequences, 1)
+# optimize
+# NOTE: hyperparameters are from GPT-3 paper
+optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, betas=(0.9, 0.95), eps=1e-8) # TODO: experiment with Muon here
+for step in range(max_steps):
+    t0 = time.time()
+    optimizer.zero_grad()
+    x, y = train_dataloader.next_batch()
+    x, y = x.to(device), y.to(device)
     
-    x = tokens.to("cuda")
-
-    # generate! right now x is (B, T) where B = 5, T = 8
-    # set the seed to 42
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-    # generate!
-    while x.size(1) < max_seq_length:
-        # forward the model to get the logits for the next token
-        with torch.no_grad():
-            logits = model(x) # (B, T, vocab_size)
-            # get the logits for the last position
-            logits = logits[:, -1, :] # (B, vocab_size)
-            # apply softmax to get the probabilities
-            probs = F.softmax(logits, dim=-1) # (B, vocab_size)
-
-            # do top-k sampling
-            topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
-
-            # select a token form top-k probabilities
-            idx_next = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
-
-            # gather the corresponding token indices
-            xcol = torch.gather(topk_indices, dim=-1, index=idx_next) # (B, 1)
-
-            # append the sampled token to the running sequence
-            x = torch.cat((x, xcol), dim=1) # (B, T+1)
+    # NOTE: read autocast documentation for more details
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     
-    for i in range(max_return_sequences):
-        tokens = x[i, :max_seq_length].tolist()
-        decoded = enc.decode(tokens)
-        print(decoded)
+    loss.backward()
+
+    # clip the global norm of the gradients to 1.0 (gpt-3 paper)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+    optimizer.step()
+    torch.cuda.synchronize() # wait for the gpu to finish work
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time difference in milliseconds
+    tokens_per_sec = (train_dataloader.B * train_dataloader.T) / (t1 - t0)
+    print(f"step {step:4d} | loss: {loss.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+
+import sys; sys.exit(0) # skip sampling part for now
+
+#----------------------------------------------------------------------------
+
+# eval part
+model = GPT.from_pretrained("gpt2")
+model.eval()
+model.to("cuda")
+
+
+text = "Hello, I'm a language model"
+tokens = enc.encode(text)
+tokens = torch.tensor(tokens, dtype=torch.long)
+tokens = tokens.unsqueeze(0).repeat(max_return_sequences, 1)
+
+x = tokens.to("cuda")
+
+# generate! right now x is (B, T) where B = 5, T = 8
+# set the seed to 42
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# generate!
+while x.size(1) < max_seq_length:
+    # forward the model to get the logits for the next token
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        # get the logits for the last position
+        logits = logits[:, -1, :] # (B, vocab_size)
+        # apply softmax to get the probabilities
+        probs = F.softmax(logits, dim=-1) # (B, vocab_size)
+
+        # do top-k sampling
+        topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
+
+        # select a token form top-k probabilities
+        idx_next = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
+
+        # gather the corresponding token indices
+        xcol = torch.gather(topk_indices, dim=-1, index=idx_next) # (B, 1)
+
+        # append the sampled token to the running sequence
+        x = torch.cat((x, xcol), dim=1) # (B, T+1)
+
+for i in range(max_return_sequences):
+    tokens = x[i, :max_seq_length].tolist()
+    decoded = enc.decode(tokens)
+    print(decoded)
