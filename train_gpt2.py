@@ -221,9 +221,11 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         with open("input.txt", "r") as f:
             text = f.read()
@@ -236,7 +238,7 @@ class DataLoaderLite:
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
     
         # state
-        self.current_position =  0
+        self.current_position = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -245,13 +247,42 @@ class DataLoaderLite:
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
 
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         
-        if self.current_position + B * T + 1 > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + B * T * self.num_processes + 1 > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
     
         return x, y
     
+
+#----------------------------------------------------------------------------
+# run training loop
+import os
+from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
+
+
+# NOTE: check how Tero do this in his code
+# set up distributed data parallel
+# torchrun command sets the env variables RANK, WORLD_SIZE, and LOCAL_RANK
+ddp = int(os.environ.get("RANK", -1)) != -1 
+print(f"ddp: {ddp}")
+if ddp:
+    assert torch.cuda.is_available(), "cuda is not available for distributed training"
+    init_process_group(backend="nccl")
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will also do logging, checkpointing, etc.
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    master_process = True
+
 
 #----------------------------------------------------------------------------
 
@@ -265,10 +296,14 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 total_batch_size = 524288
 B = 8 # micro batch size
 T = 1024 # sequence length
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size: {total_batch_size}")
-print(f"calculated gradient accumulation steps: {grad_accum_steps}")
-train_dataloader = DataLoaderLite(B=B, T=T)
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+
+if master_process:
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"calculated gradient accumulation steps: {grad_accum_steps}")
+
+
+train_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 # Read https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf
 # to see difference between float32, tensorfloat32 and bfloat16
@@ -277,6 +312,9 @@ torch.set_float32_matmul_precision("high")
 model = GPT(GPTConfig()) # can change vocab size here to be "nice number"
 model.to(device)
 model = torch.compile(model) # huge speed up from this op
+if ddp:
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 
 #----------------------------------------------------------------------------
 
@@ -305,7 +343,7 @@ def get_lr(step):
 
 # optimize
 # NOTE: hyperparameters are from GPT-3 paper
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device) # TODO: experiment with Muon here
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device) # TODO: experiment with Muon here
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
@@ -319,9 +357,15 @@ for step in range(max_steps):
             logits, loss = model(x, y)
         
         loss = loss / grad_accum_steps # scale the loss by the number of gradient accumulation steps
+        
+        # only sync gradients on the last micro_step
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss_accum += loss.detach()
         loss.backward()
 
+    if ddp:
+        dist.all_reduce(loss, op=dist.ReduceOp.AVG)
     # clip the global norm of the gradients to 1.0 (gpt-3 paper)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -334,7 +378,12 @@ for step in range(max_steps):
     t1 = time.time()
     dt = (t1 - t0) * 1000 # time difference in milliseconds
     tokens_per_sec = (train_dataloader.B * train_dataloader.T) * grad_accum_steps / (t1 - t0)
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
 
 import sys; sys.exit(0) # skip sampling part for now
 
