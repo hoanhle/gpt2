@@ -219,23 +219,35 @@ class GPT(nn.Module):
 #----------------------------------------------------------------------------
 
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    return torch.tensor(npt, dtype=torch.long)
+
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
 
-        with open("input.txt", "r") as f:
-            text = f.read()
+        # load the shards
+        data_dir = "edu_fineweb10B"
+        shards = os.listdir(data_dir)
+        shards = [os.path.join(data_dir, shard) for shard in shards if shard.startswith(f"edufineweb_{split}")]
+        shards.sort()
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
+
         
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+        self.current_shard = 0
+        self.tokens = load_tokens(shards[self.current_shard])
+
     
         # state
         self.current_position = self.B * self.T * self.process_rank
@@ -251,7 +263,9 @@ class DataLoaderLite:
         
         if self.current_position + B * T * self.num_processes + 1 > len(self.tokens):
             self.current_position = self.B * self.T * self.process_rank
-    
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+
         return x, y
     
 
@@ -294,7 +308,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 total_batch_size = 524288
-B = 8 # micro batch size
+B = 16 # micro batch size
 T = 1024 # sequence length
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 
@@ -303,7 +317,7 @@ if master_process:
     print(f"calculated gradient accumulation steps: {grad_accum_steps}")
 
 
-train_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
 # Read https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf
 # to see difference between float32, tensorfloat32 and bfloat16
@@ -322,8 +336,8 @@ raw_model = model.module if ddp else model
 # NOTE: follow the paper's suggestion to use 6e-4 as max_lr for 124M model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 def get_lr(step):
     # 1. linear warmup for warmup_iters steps
     if step < warmup_steps:
