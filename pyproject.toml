@@ -8,6 +8,7 @@ dependencies = [
     "torch>=2.9.0",
     "transformers",
     "tiktoken>=0.11.0",
+    "datasets"
 ]
 
 [project.optional-dependencies]  
