@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import time
+from hellaswag import iterate_examples, render_example, get_most_likely_row
 
 #----------------------------------------------------------------------------
 
@@ -333,7 +334,12 @@ val_dataloader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=d
 torch.set_float32_matmul_precision("high")
 model = GPT(GPTConfig()) # can change vocab size here to be "nice number"
 model.to(device)
-model = torch.compile(model) # huge speed up from this op
+
+use_compile = False # TODO: fix torch.compile interferes with HellaSwag eval and Generation
+if use_compile:
+    model = torch.compile(model) # huge speed up from this op
+
+
 if ddp:
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
@@ -366,11 +372,18 @@ def get_lr(step):
 # optimize
 # NOTE: hyperparameters are from GPT-3 paper
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device) # TODO: experiment with Muon here
+
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
+with open(log_file, "w") as f:
+    pass
+
 for step in range(max_steps):
     t0 = time.time()
 
     # validation
-    if step % 100 == 0:
+    if step % 250 == 0 or step == max_steps - 1:
         model.eval()
         val_dataloader.reset()
         with torch.no_grad():
@@ -388,8 +401,48 @@ for step in range(max_steps):
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
     
-    if step > 0 and step % 100 == 0:
+
+    # evaluate on HellaSwag
+    if (step % 250 == 0 or step == max_steps - 1) and not use_compile:
+        num_correct_norm = 0
+        num_total = 0
+
+        for i, example in enumerate(iterate_examples("val")):
+            if i % ddp_world_size != ddp_rank:
+                continue
+            
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            
+            with torch.no_grad():
+                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                    logits, _ = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            
+            num_correct_norm += (pred_norm == label)
+            num_total += 1
+
+        if ddp:
+            num_correct_norm = torch.tensor(num_correct_norm, device=device, dtype=torch.long)
+            num_total = torch.tensor(num_total, device=device, dtype=torch.long)
+            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+            num_correct_norm = num_correct_norm.item()
+            num_total = num_total.item()
+        
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")
+
+
+    # once in a while generate from the model (except step 0, which is noise)
+    if step > 0 and (step % 250 == 0 or step == max_steps - 1):
         model.eval()
         max_return_sequences = 4
         max_seq_length = 32
@@ -404,7 +457,7 @@ for step in range(max_steps):
 
         while xgen.size(1) < max_seq_length:
             with torch.no_grad():
-                logits = model(xgen)
+                logits, _ = model(xgen)
                 # get the logits for the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
 
@@ -422,7 +475,7 @@ for step in range(max_steps):
         for i in range(max_return_sequences):
             tokens = xgen[i, :max_seq_length].tolist()
             decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} : {decoded}")
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
 
 
     # training
@@ -462,10 +515,10 @@ for step in range(max_steps):
 
     if master_process:
         print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
-
-import sys; sys.exit(0) # skip sampling part for now
 
 #----------------------------------------------------------------------------
