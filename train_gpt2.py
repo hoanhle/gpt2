@@ -315,7 +315,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288
-B = 16 # micro batch size
+B = 64 # micro batch size # TODO: reduce if necessary
 T = 1024 # sequence length
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 
