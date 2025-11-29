@@ -2,6 +2,8 @@
 
 2 years ago I wrote a deep dive on [From Transformers to ChatGPT](https://hoanhle.github.io/blog/2023/chatgpt/), and now I want to refresh some of my knowledge by reproducing gpt-2 from scratch.
 
+I will slowly introduce algorithmic improvements from [gpt-oss](https://magazine.sebastianraschka.com/p/from-gpt-2-to-gpt-oss-analyzing-the?hide_intro_popup=true), and a few ideas from vision / graphics world (e.g: magnitude preserving and weight constraints from [edm2](https://arxiv.org/abs/2312.02696) paper, which is somewhat similar to [Thinking Machine's blog](https://thinkingmachines.ai/blog/modular-manifolds/)).
+
 ## setup
 
 To train this on multi-gpu (8xH100) cloud, I went with [Prime Intellect](https://www.primeintellect.ai/) and [Datacrunch](https://verda.com/). At 
