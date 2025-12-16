@@ -119,7 +119,7 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std *= (2 * module.NANOGPT_SCALE_INIT) ** 0.5
+                std *= (2 * self.config.n_layer) ** 0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
