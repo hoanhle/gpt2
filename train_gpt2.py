@@ -291,8 +291,8 @@ print(f"ddp: {ddp}")
 if ddp:
     assert torch.cuda.is_available(), "cuda is not available for distributed training"
     init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_rank = int(os.environ["RANK"]) # unique id for each process across all nodes
+    ddp_local_rank = int(os.environ["LOCAL_RANK"]) # unique id for each process within a single node
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
