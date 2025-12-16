@@ -8,6 +8,54 @@ import time
 from hellaswag import iterate_examples, render_example, get_most_likely_row
 
 #----------------------------------------------------------------------------
+# save load checkpoint
+
+def save_checkpoint(model, optimizer, step, loss, config, file_path, is_ddp):
+    if is_ddp:
+        model = model.module
+    
+    checkpoint = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'step': step,
+        'loss': loss,
+        'config': config
+    }
+    # atomic save
+    temp_file_path = file_path + ".temp"
+    torch.save(checkpoint, temp_file_path)
+    os.rename(temp_file_path, file_path)
+
+def load_checkpoint(file_path, model, optimizer, is_ddp, device = 'cuda', strict = True):
+    if is_ddp:
+        model = model.module
+    checkpoint = torch.load(file_path, map_location=device, weights_only=False)
+
+    if strict:
+        model.load_state_dict(checkpoint['model'], strict=True)
+    else:
+        model_state = model.state_dict()
+        pretrained_state = checkpoint['model']
+        matched_state = {}
+
+        for key in model_state.keys():
+            if key in pretrained_state and model_state[key].shape == pretrained_state[key].shape:
+                matched_state[key] = pretrained_state[key]
+        
+        model_state.update(matched_state)
+        model.load_state_dict(model_state)
+
+    #TODO: only load optimizer if strict
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+    return checkpoint['step'], checkpoint['loss'], checkpoint['config']
+
+#----------------------------------------------------------------------------
 
 @dataclass
 class GPTConfig:
